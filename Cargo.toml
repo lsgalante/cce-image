@@ -1,5 +1,5 @@
 [package]
-name = "cce-preview"
+name = "cce-image"
 version = "0.1.0"
 edition = "2021"
 

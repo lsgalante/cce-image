@@ -1,16 +1,15 @@
-//! cce-preview — document and image viewer in the spirit of macOS Preview.
+//! cce-image — the image viewer.
 //!
-//! One continuous vertically-scrolled document: PDF pages (rasterized
-//! lazily per page via poppler's pdftoppm, re-rendered at higher DPI as
-//! you zoom) or a single raster image. View state is a zoom factor
-//! (screen px per document unit) plus a scroll offset; pages are laid out
-//! in document units so zoom-at-pointer is an exact rescale.
+//! One picture at a time, browsed among its directory's images (or the
+//! files named on the command line). View state is a zoom factor (screen px
+//! per source px) plus a scroll offset, so zoom-at-pointer is an exact
+//! rescale. Split from cce-preview, whose PDF half became cce-documents.
 //!
 //! Keys: o open · +/- zoom · 0 fit · 1 actual size · r/l rotate ·
-//! arrows/PageUp/PageDown pages (or prev/next file for images) · q quit.
+//! ←/→ PageUp/PageDown previous/next file · Home/End first/last · q quit.
 //! Wheel scrolls, ctrl+wheel and pinch zoom at the pointer, drag pans.
 
-mod doc;
+mod store;
 
 use std::path::{Path, PathBuf};
 
@@ -21,13 +20,9 @@ use cce_ui::scene::paint::{DisplayList, PaintCtx};
 use cce_ui::widget::scroll_motion::{Bounds, ScrollMotion};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Position};
 
-use doc::{Document, PageStore, Rendered, IMAGE_EXTS};
+use store::{is_image, ImageStore, Picture, IMAGE_EXTS};
 
-/// Vertical gap between pages, in document units (so the layout scales
-/// uniformly with zoom and anchored zooming stays exact).
-const GAP_UNITS: f64 = 12.0;
-/// Margin left around a fitted page.
-/// Room around a fitted page: the root plate's inset on each side.
+/// Room around a fitted picture: the root plate's inset on each side.
 fn fit_margin() -> f64 {
     2.0 * cce_ui::layout::root_plate_inset() as f64
 }
@@ -35,27 +30,24 @@ const WHEEL_SCROLL_PX: f64 = 48.0;
 const KEY_SCROLL_PX: f64 = 80.0;
 const ZOOM_MIN: f64 = 0.05;
 const ZOOM_MAX: f64 = 16.0;
-/// DPI steps pages are rendered at; bucketing keeps small zoom jitters from
-/// re-rasterizing every page.
-const DPI_BUCKETS: &[u32] = &[36, 48, 72, 96, 144, 192, 288, 384, 576];
 
 #[derive(Debug, Clone)]
 enum Message {
-    Page { generation: u64, page: usize, result: Option<Rendered> },
+    Decoded { generation: u64, result: Option<u32> },
     Quit,
 }
 
-struct PreviewApp {
-    store: PageStore,
-    doc: Option<Document>,
+struct ImageApp {
+    store: ImageStore,
+    pic: Option<Picture>,
     error: Option<String>,
-    /// Sibling files for ArrowLeft/Right browsing (CLI args, or the images
-    /// in the opened file's directory).
+    /// Files for ArrowLeft/Right browsing (CLI args, or the images in the
+    /// opened file's directory).
     files: Vec<PathBuf>,
     file_idx: usize,
-    /// User rotation in quarter turns clockwise, whole-document.
+    /// User rotation in quarter turns clockwise.
     quarter_turns: u8,
-    /// Screen px per document unit (pt for PDFs, source px for images).
+    /// Screen px per source px.
     zoom: f64,
     /// Scroll offset in screen px; 0 when the content fits the window.
     scroll: (f64, f64),
@@ -77,35 +69,14 @@ struct PreviewApp {
     seen_renderer: bool,
 }
 
-/// Per-page layout rect in document units.
-struct PageRect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-}
-
-impl PreviewApp {
-    fn rotated(&self, page: doc::PageSize) -> (f64, f64) {
-        if self.quarter_turns % 2 == 1 {
-            (page.h, page.w)
-        } else {
-            (page.w, page.h)
+impl ImageApp {
+    /// The picture's size after rotation, in source px; zero when none.
+    fn content(&self) -> (f64, f64) {
+        match &self.pic {
+            Some(p) if self.quarter_turns % 2 == 1 => (p.h, p.w),
+            Some(p) => (p.w, p.h),
+            None => (0.0, 0.0),
         }
-    }
-
-    /// Page rects stacked vertically, centered in the content width.
-    fn layout(&self) -> (Vec<PageRect>, f64, f64) {
-        let Some(doc) = &self.doc else { return (Vec::new(), 0.0, 0.0) };
-        let content_w = doc.pages.iter().map(|p| self.rotated(*p).0).fold(0.0, f64::max);
-        let mut rects = Vec::with_capacity(doc.pages.len());
-        let mut y = 0.0;
-        for page in &doc.pages {
-            let (w, h) = self.rotated(*page);
-            rects.push(PageRect { x: (content_w - w) / 2.0, y, w, h });
-            y += h + GAP_UNITS;
-        }
-        (rects, content_w, y - GAP_UNITS)
     }
 
     /// Top-left of the content in screen coords: centered when it fits,
@@ -118,7 +89,7 @@ impl PreviewApp {
     }
 
     fn clamp_scroll(&mut self) {
-        let (_, cw, ch) = self.layout();
+        let (cw, ch) = self.content();
         let (w, h) = (self.win.0 as f64, self.win.1 as f64);
         self.scroll.0 = self.scroll.0.clamp(0.0, (cw * self.zoom - w).max(0.0));
         self.scroll.1 = self.scroll.1.clamp(0.0, (ch * self.zoom - h).max(0.0));
@@ -132,7 +103,7 @@ impl PreviewApp {
 
     /// The wheel's range per axis, `0..=overflow` — what `clamp_scroll` clamps to.
     fn scroll_bounds(&self) -> (Bounds, Bounds) {
-        let (_, cw, ch) = self.layout();
+        let (cw, ch) = self.content();
         let (w, h) = (self.win.0 as f64, self.win.1 as f64);
         (Bounds::max((cw * self.zoom - w) as f32), Bounds::max((ch * self.zoom - h) as f32))
     }
@@ -158,7 +129,7 @@ impl PreviewApp {
 
     /// Multiply zoom, keeping the document point under (px, py) fixed.
     fn zoom_at(&mut self, factor: f64, px: f64, py: f64) {
-        let (_, cw, ch) = self.layout();
+        let (cw, ch) = self.content();
         let (ox, oy) = self.origin(cw, ch);
         let (dx, dy) = ((px - ox) / self.zoom, (py - oy) / self.zoom);
         self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
@@ -171,47 +142,30 @@ impl PreviewApp {
         self.clamp_scroll();
     }
 
-    /// The page overlapping the viewport center (for HUD and refit).
-    fn current_page(&self) -> usize {
-        let (rects, cw, ch) = self.layout();
-        let (_, oy) = self.origin(cw, ch);
-        let mid = (self.win.1 as f64 / 2.0 - oy) / self.zoom;
-        rects
-            .iter()
-            .position(|r| mid < r.y + r.h + GAP_UNITS / 2.0)
-            .unwrap_or(rects.len().saturating_sub(1))
-    }
-
-    /// Fit the given page inside the window and scroll to its top.
-    fn fit_page(&mut self, page: usize) {
-        let (rects, _, _) = self.layout();
-        let Some(r) = rects.get(page) else { return };
-        let (w, h) = ((self.win.0 as f64 - fit_margin()).max(64.0), (self.win.1 as f64 - fit_margin()).max(64.0));
-        self.zoom = (w / r.w).min(h / r.h).clamp(ZOOM_MIN, ZOOM_MAX);
-        self.fit = true;
-        self.scroll = (0.0, r.y * self.zoom);
-        self.clamp_scroll();
-    }
-
-    fn go_to_page(&mut self, page: usize) {
-        let (rects, _, _) = self.layout();
-        if let Some(r) = rects.get(page) {
-            self.scroll.1 = (r.y - GAP_UNITS / 2.0) * self.zoom;
-            self.clamp_scroll();
+    /// Fit the picture inside the window, never enlarging past actual
+    /// size (a small icon stays crisp instead of blowing up).
+    fn fit(&mut self) {
+        let (cw, ch) = self.content();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
         }
+        let (w, h) = ((self.win.0 as f64 - fit_margin()).max(64.0), (self.win.1 as f64 - fit_margin()).max(64.0));
+        self.zoom = (w / cw).min(h / ch).min(1.0).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.fit = true;
+        self.scroll = (0.0, 0.0);
     }
 
     fn open(&mut self, path: &Path, rebuild_collection: bool) {
         self.store.reset();
         self.quarter_turns = 0;
         self.error = None;
-        match Document::load(path) {
-            Ok(d) => {
-                self.doc = Some(d);
-                self.fit_page(0);
+        match Picture::load(path) {
+            Ok(p) => {
+                self.pic = Some(p);
+                self.fit();
             }
             Err(e) => {
-                self.doc = None;
+                self.pic = None;
                 self.error = Some(format!("{}: {e}", path.display()));
             }
         }
@@ -225,17 +179,20 @@ impl PreviewApp {
             return;
         }
         let n = self.files.len() as i64;
-        self.file_idx = ((self.file_idx as i64 + step).rem_euclid(n)) as usize;
-        let path = self.files[self.file_idx].clone();
+        self.open_index(((self.file_idx as i64 + step).rem_euclid(n)) as usize);
+    }
+
+    fn open_index(&mut self, idx: usize) {
+        if idx >= self.files.len() || (idx == self.file_idx && self.pic.is_some()) {
+            return;
+        }
+        self.file_idx = idx;
+        let path = self.files[idx].clone();
         self.open(&path, false);
     }
 
     fn open_dialog(&mut self) {
-        let filters: &[(&str, &[&str])] = &[
-            ("Documents & images", &["pdf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico"]),
-            ("PDF", &["pdf"]),
-            ("Images", IMAGE_EXTS),
-        ];
+        let filters: &[(&str, &[&str])] = &[("Images", IMAGE_EXTS)];
         if let Some(path) = cce_ui::file_dialog::pick_file("Open", filters) {
             self.open(&path, true);
         }
@@ -246,7 +203,7 @@ impl PreviewApp {
         self.store.reset();
         self.clamp_scroll();
         if self.fit {
-            self.fit_page(self.current_page());
+            self.fit();
         }
     }
 
@@ -259,14 +216,9 @@ impl PreviewApp {
 }
 
 /// The file's siblings for arrow-key browsing: images in the same
-/// directory, name-sorted, with the opened file's position. PDFs browse
-/// their own pages instead, so they get a singleton collection.
+/// directory, name-sorted, with the opened file's position.
 fn collection_for(path: &Path) -> (Vec<PathBuf>, usize) {
-    let is_image = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()));
-    if !is_image {
+    if !is_image(path) {
         return (vec![path.to_path_buf()], 0);
     }
     let mut files: Vec<PathBuf> = path
@@ -275,11 +227,7 @@ fn collection_for(path: &Path) -> (Vec<PathBuf>, usize) {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        })
+        .filter(|p| is_image(p))
         .collect();
     files.sort();
     let idx = files.iter().position(|p| p == path).unwrap_or(0);
@@ -290,15 +238,15 @@ fn collection_for(path: &Path) -> (Vec<PathBuf>, usize) {
     }
 }
 
-impl Application for PreviewApp {
+impl Application for ImageApp {
     type Message = Message;
 
     fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         // The app keeps calloop's sender; `AppSender` converts into it.
         let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let mut app = Self {
-            store: PageStore::new(sender),
-            doc: None,
+            store: ImageStore::new(sender),
+            pic: None,
             error: None,
             files: Vec::new(),
             file_idx: 0,
@@ -330,20 +278,16 @@ impl Application for PreviewApp {
     }
 
     fn settings(&self) -> WindowSettings {
-        let title = match &self.doc {
-            Some(d) => {
-                let name = d.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                if d.pages.len() > 1 {
-                    format!("{name} (page {}/{}) — Preview", self.current_page() + 1, d.pages.len())
-                } else {
-                    format!("{name} — Preview")
-                }
+        let title = match &self.pic {
+            Some(p) => {
+                let name = p.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                format!("{name} — Image")
             }
-            None => "Preview".to_string(),
+            None => "Image".to_string(),
         };
         WindowSettings {
             title,
-            app_id: "cce-preview".to_string(),
+            app_id: "cce-image".to_string(),
             width: 900,
             height: 700,
             fullscreen: false,
@@ -353,8 +297,8 @@ impl Application for PreviewApp {
 
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
-            Message::Page { generation, page, result } => {
-                self.store.complete(generation, page, result);
+            Message::Decoded { generation, result } => {
+                self.store.complete(generation, result);
                 *needs_rebuild = true;
             }
             Message::Quit => *exit = true,
@@ -367,28 +311,28 @@ impl Application for PreviewApp {
         }
     }
 
-    /// Throw the resident pages away when the renderer is replaced.
+    /// Throw the resident picture away when the renderer is replaced.
     ///
-    /// `PageStore` holds **renderer** image ids, and a renderer does not
+    /// `ImageStore` holds a **renderer** image id, and a renderer does not
     /// outlive its session: `cce-ui`'s `window_runner` repairs a lost Wayland
     /// transport by opening a new session around the same `Application`, which
-    /// rebuilds the renderer and with it the image table. The cached ids then
-    /// name images that no longer exist, and a draw for an unknown id is
+    /// rebuilds the renderer and with it the image table. The cached id then
+    /// names an image that no longer exists, and a draw for an unknown id is
     /// skipped rather than reported — so a reconnected viewer came back with
-    /// its chrome and a blank document, and stayed that way, because a
-    /// resident page is never re-rendered.
+    /// its chrome and a blank picture, and stayed that way, because a
+    /// resident picture is never decoded again.
     ///
-    /// `reset` is exactly the right hammer: it frees every page (a free for an
+    /// `reset` is exactly the right hammer: it frees the image (a free for an
     /// id the new renderer never had is a no-op) and bumps the generation, so
-    /// a render still in flight for the old session is dropped on arrival
-    /// instead of landing as a page nobody asked for. The next `display_list`
-    /// finds nothing resident and queues the visible pages again.
+    /// a decode still in flight for the old session is dropped on arrival
+    /// instead of landing as a picture nobody asked for. The next
+    /// `display_list` finds nothing resident and queues the decode again.
     ///
-    /// Not on the first renderer: the pages queued from `new()` are waiting
+    /// Not on the first renderer: the decode queued from `new()` is waiting
     /// for precisely that one.
     fn renderer_init(&mut self, _renderer: &mut cce_ui::vk::VkRenderer) {
         if std::mem::replace(&mut self.seen_renderer, true) {
-            log::info!("[preview] renderer replaced; re-rendering the resident pages");
+            log::info!("[image] renderer replaced; decoding the picture again");
             self.store.reset();
         }
     }
@@ -397,7 +341,7 @@ impl Application for PreviewApp {
         self.win = (width, height);
         self.scale = scale;
         if self.fit {
-            self.fit_page(self.current_page());
+            self.fit();
         } else {
             self.clamp_scroll();
         }
@@ -481,13 +425,11 @@ impl Application for PreviewApp {
         }
         log::debug!("key: {:?} text={:?} ctrl={} shift={}", event.logical_key, event.text, event.ctrl, event.shift);
         let (cx, cy) = (self.win.0 as f64 / 2.0, self.win.1 as f64 / 2.0);
-        let pages = self.doc.as_ref().map_or(0, |d| d.pages.len());
-        let file_nav = pages <= 1 && self.files.len() > 1;
         let mut handled = true;
         match &event.logical_key {
             Key::Character(c) if c == "+" || c == "=" => self.zoom_at(1.25, cx, cy),
             Key::Character(c) if c == "-" => self.zoom_at(0.8, cx, cy),
-            Key::Character(c) if c == "0" => self.fit_page(self.current_page()),
+            Key::Character(c) if c == "0" => self.fit(),
             Key::Character(c) if c == "1" => {
                 let f = 1.0 / self.zoom;
                 self.zoom_at(f, cx, cy);
@@ -498,19 +440,11 @@ impl Application for PreviewApp {
             Key::Character(c) if c == "q" => return Some(Message::Quit),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(0.0, -KEY_SCROLL_PX),
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(0.0, KEY_SCROLL_PX),
-            Key::Named(NamedKey::ArrowLeft) if file_nav => self.open_sibling(-1),
-            Key::Named(NamedKey::ArrowRight) if file_nav => self.open_sibling(1),
-            Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => {
-                let p = self.current_page();
-                self.go_to_page(p.saturating_sub(1));
-            }
-            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::PageDown) => {
-                let p = self.current_page();
-                self.go_to_page((p + 1).min(pages.saturating_sub(1)));
-            }
+            Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => self.open_sibling(-1),
+            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::PageDown) => self.open_sibling(1),
             Key::Named(NamedKey::Space) => self.scroll_by(0.0, self.win.1 as f64 * 0.9),
-            Key::Named(NamedKey::Home) => self.go_to_page(0),
-            Key::Named(NamedKey::End) => self.go_to_page(pages.saturating_sub(1)),
+            Key::Named(NamedKey::Home) => self.open_index(0),
+            Key::Named(NamedKey::End) => self.open_index(self.files.len().saturating_sub(1)),
             _ => handled = false,
         }
         if handled {
@@ -522,63 +456,36 @@ impl Application for PreviewApp {
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<DisplayList> {
         self.win = (size.width, size.height);
         self.scale = scale;
-        self.store.begin_frame();
         let mut pc = PaintCtx::new();
         // The standard root plate (cce-ui PlateSpec::window); the document is
         // full-bleed content drawn on it.
         pc.root_plate(size.width, size.height);
 
-        if self.doc.is_none() {
-            let msg = self.error.as_deref().unwrap_or("Press 'o' to open a file");
+        if self.pic.is_none() {
+            let msg = self.error.as_deref().unwrap_or("Press 'o' to open an image");
             pc.text(msg, cce_ui::layout::root_plate_inset(), size.height / 2.0 - 8.0, 14.0, [180, 180, 180]);
             return Some(pc.finish());
         }
 
-        let (rects, cw, ch) = self.layout();
+        let (cw, ch) = self.content();
         let (ox, oy) = self.origin(cw, ch);
-        let want_dpi = {
-            let want = 72.0 * self.zoom * scale;
-            *DPI_BUCKETS
-                .iter()
-                .find(|&&b| want <= b as f64 * 1.01)
-                .unwrap_or(DPI_BUCKETS.last().unwrap())
-        };
-
-        let mut visible = Vec::new();
-        for (i, r) in rects.iter().enumerate() {
-            let rect = Rect {
-                x: (ox + r.x * self.zoom) as f32,
-                y: (oy + r.y * self.zoom) as f32,
-                width: (r.w * self.zoom) as f32,
-                height: (r.h * self.zoom) as f32,
-            };
-            if rect.y > size.height || rect.y + rect.height < 0.0 {
-                continue;
-            }
-            visible.push((i, rect));
+        let rect = Rect { x: ox as f32, y: oy as f32, width: (cw * self.zoom) as f32, height: (ch * self.zoom) as f32 };
+        // White ground: placeholder while decoding, and backing for
+        // transparency.
+        pc.quad(
+            Rect { x: rect.x - 1.0, y: rect.y - 1.0, width: rect.width + 2.0, height: rect.height + 2.0 },
+            [0.0, 0.0, 0.0, 0.35],
+        );
+        pc.quad(rect, [0.97, 0.97, 0.97, 1.0]);
+        let pic = self.pic.as_ref().unwrap();
+        if let Some(image) = self.store.ensure(pic, self.quarter_turns) {
+            pc.image(image, rect, 1.0);
         }
-        let doc = self.doc.take().unwrap();
-        for (i, rect) in &visible {
-            // White page ground: placeholder while rendering, and backing
-            // for images with transparency.
-            pc.quad(
-                Rect { x: rect.x - 1.0, y: rect.y - 1.0, width: rect.width + 2.0, height: rect.height + 2.0 },
-                [0.0, 0.0, 0.0, 0.35],
-            );
-            pc.quad(*rect, [0.97, 0.97, 0.97, 1.0]);
-            if let Some(r) = self.store.ensure(&doc, self.quarter_turns, *i, want_dpi) {
-                pc.image(r.image, *rect, 1.0);
-            }
-        }
-        self.doc = Some(doc);
 
-        // HUD: file name, page, zoom (top-left chip).
-        let doc = self.doc.as_ref().unwrap();
-        let name = doc.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        // HUD: file name, position among its siblings, zoom (top-left chip).
+        let name = pic.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let mut hud = name.to_string();
-        if doc.pages.len() > 1 {
-            hud.push_str(&format!("   ·   page {}/{}", self.current_page() + 1, doc.pages.len()));
-        } else if self.files.len() > 1 {
+        if self.files.len() > 1 {
             hud.push_str(&format!("   ·   {}/{}", self.file_idx + 1, self.files.len()));
         }
         hud.push_str(&format!("   ·   {:.0}%", self.zoom * 100.0));
@@ -604,5 +511,5 @@ impl Application for PreviewApp {
 
 fn main() {
     env_logger::init();
-    cce_ui::engine::run::<PreviewApp>();
+    cce_ui::engine::run::<ImageApp>();
 }

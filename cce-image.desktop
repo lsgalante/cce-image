@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Image
+GenericName=Image Viewer
+Comment=View images
+Exec=cce-image %f
+Icon=cce-image
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/vnd.microsoft.icon;
+NoDisplay=false
