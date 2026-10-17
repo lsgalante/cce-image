@@ -430,6 +430,8 @@ dependencies = [
  "env_logger",
  "image",
  "log",
+ "serde",
+ "serde_json",
  "wayland-client",
 ]
 

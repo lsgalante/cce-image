@@ -10,6 +10,7 @@
 //! Wheel scrolls, ctrl+wheel and pinch zoom at the pointer, drag pans.
 
 mod store;
+mod ui_state;
 
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,8 @@ struct ImageApp {
     scroll_motion: ScrollMotion,
     /// Refit on resize until the user zooms manually.
     fit: bool,
+    /// A reopened view (`ui_state`), waiting for the window's real size.
+    pending_view: Option<ui_state::View>,
     win: (f32, f32),
     scale: f64,
     pointer: (f64, f64),
@@ -155,6 +158,43 @@ impl ImageApp {
         self.scroll = (0.0, 0.0);
     }
 
+    /// How the picture is viewed, for `ui_state`.
+    fn view(&self) -> ui_state::View {
+        if let Some(view) = self.pending_view {
+            return view;
+        }
+        let (cw, ch) = self.content();
+        let (ox, oy) = self.origin(cw, ch);
+        let (w, h) = (self.win.0 as f64, self.win.1 as f64);
+        let center = if cw > 0.0 && ch > 0.0 {
+            (((w / 2.0 - ox) / self.zoom / cw).clamp(0.0, 1.0), ((h / 2.0 - oy) / self.zoom / ch).clamp(0.0, 1.0))
+        } else {
+            (0.5, 0.5)
+        };
+        ui_state::View { quarter_turns: self.quarter_turns, fit: self.fit, zoom: self.zoom, center }
+    }
+
+    /// Put a reopened view back once the window has its size: the same
+    /// rotation and zoom, the same picture point at the window's center,
+    /// clamped to the picture as it fits this window.
+    fn settle_pending_view(&mut self) {
+        let Some(view) = self.pending_view.take() else { return };
+        self.quarter_turns = view.quarter_turns % 4;
+        self.store.reset();
+        if view.fit || !view.zoom.is_finite() {
+            self.fit();
+            return;
+        }
+        let (cw, ch) = self.content();
+        let (w, h) = (self.win.0 as f64, self.win.1 as f64);
+        self.zoom = view.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        self.fit = false;
+        let (fx, fy) = (view.center.0.clamp(0.0, 1.0), view.center.1.clamp(0.0, 1.0));
+        self.scroll.0 = ((w - cw * self.zoom) / 2.0).max(0.0) - w / 2.0 + fx * cw * self.zoom;
+        self.scroll.1 = ((h - ch * self.zoom) / 2.0).max(0.0) - h / 2.0 + fy * ch * self.zoom;
+        self.clamp_scroll();
+    }
+
     fn open(&mut self, path: &Path, rebuild_collection: bool) {
         self.store.reset();
         self.quarter_turns = 0;
@@ -163,6 +203,7 @@ impl ImageApp {
             Ok(p) => {
                 self.pic = Some(p);
                 self.fit();
+                ui_state::save(path, self.view());
             }
             Err(e) => {
                 self.pic = None;
@@ -255,6 +296,7 @@ impl Application for ImageApp {
             scroll: (0.0, 0.0),
             scroll_motion: ScrollMotion::new(),
             fit: true,
+            pending_view: None,
             win: (900.0, 700.0),
             scale: 1.0,
             pointer: (0.0, 0.0),
@@ -264,6 +306,24 @@ impl Application for ImageApp {
             seen_renderer: false,
         };
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+        if let Some(saved) = ui_state::initial(&args) {
+            // Reopen where it was (`ui_state`): browsing the command line's
+            // files when it is one of them, else its directory's images.
+            let listed = args.iter().position(|p| std::path::absolute(p).is_ok_and(|p| p == saved.path));
+            app.pending_view = Some(saved.view);
+            match listed {
+                Some(idx) if args.len() > 1 => {
+                    app.files = args;
+                    app.file_idx = idx;
+                    app.open(&saved.path, false);
+                }
+                _ => app.open(&saved.path, true),
+            }
+            if app.pic.is_none() {
+                app.pending_view = None;
+            }
+            return app;
+        }
         match args.len() {
             0 => {}
             1 => app.open(&args[0].clone(), true),
@@ -340,7 +400,9 @@ impl Application for ImageApp {
     fn handle_resize(&mut self, width: f32, height: f32, scale: f64) {
         self.win = (width, height);
         self.scale = scale;
-        if self.fit {
+        if self.pending_view.is_some() {
+            self.settle_pending_view();
+        } else if self.fit {
             self.fit();
         } else {
             self.clamp_scroll();
@@ -456,6 +518,7 @@ impl Application for ImageApp {
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<DisplayList> {
         self.win = (size.width, size.height);
         self.scale = scale;
+        self.settle_pending_view();
         let mut pc = PaintCtx::new();
         // The standard root plate (cce-ui PlateSpec::window); the document is
         // full-bleed content drawn on it.
@@ -506,6 +569,13 @@ impl Application for ImageApp {
 
     fn clear_color(&self) -> [f32; 4] {
         [0.13, 0.13, 0.14, 1.0]
+    }
+
+    /// Keep how the picture is viewed for the next launch (`ui_state`).
+    fn on_exit(&mut self) {
+        if let Some(pic) = &self.pic {
+            ui_state::save(&pic.path, self.view());
+        }
     }
 }
 
